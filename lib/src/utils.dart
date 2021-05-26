@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
@@ -227,5 +228,229 @@ Stream<List<int>> zeroes(int length) async* {
   final remainingBytes = length % chunkSize;
   if (remainingBytes != 0) {
     yield Uint8List(remainingBytes);
+  }
+}
+
+Stream<Uint8List> _inChunks(Stream<List<int>> input) {
+  Uint8List? startedChunk;
+  int missingForNextChunk = 0;
+
+  Uint8List? pendingEvent;
+  int offsetInPendingEvent = 0;
+
+  late StreamSubscription<List<int>> inputSubscription;
+  final controller = StreamController<Uint8List>(sync: true);
+
+  var isResuming = false;
+
+  void startChunk(Uint8List source, int startOffset) {
+    assert(startedChunk == null);
+    final availableData = source.length - startOffset;
+    assert(availableData < blockSize);
+
+    startedChunk = Uint8List(blockSize)
+      ..setAll(0, source.sublistView(startOffset));
+    missingForNextChunk = blockSize - availableData;
+  }
+
+  void handleData(List<int> data) {
+    assert(pendingEvent == null,
+        'Had pending events while receiving new data from source.');
+    final typedData = data.asUint8List();
+
+    // The start offset of the new data that we didn't process yet.
+    var offsetInData = 0;
+    bool saveStateIfPaused() {
+      if (controller.isPausedOrClosed) {
+        pendingEvent = typedData;
+        offsetInPendingEvent = offsetInData;
+        return true;
+      }
+      return false;
+    }
+
+    // Try completing the pending chunk first, if it exists
+    if (startedChunk != null) {
+      final started = startedChunk!;
+      final startOffsetInStarted = blockSize - missingForNextChunk;
+
+      if (data.length >= missingForNextChunk) {
+        // Fill up the chunk, then go on with the remaining data
+        started.setAll(startOffsetInStarted,
+            typedData.sublistView(0, missingForNextChunk));
+        controller.add(started);
+        offsetInData += missingForNextChunk;
+
+        // We just finished serving the started chunk, so reset that
+        startedChunk = null;
+        missingForNextChunk = 0;
+
+        // If the controller was paused in a response to the add, stop serving
+        // events and store the rest of the input for later
+        if (saveStateIfPaused()) return;
+      } else {
+        // Ok, we can't finish the pending chunk with the new data but at least
+        // we can continue filling it up
+        started.setAll(startOffsetInStarted, typedData);
+        missingForNextChunk -= typedData.length;
+        return;
+      }
+    }
+
+    // The started chunk has been completed, continue by adding chunks as they
+    // come.
+    assert(startedChunk == null);
+
+    while (offsetInData < typedData.length) {
+      // Can we serve a full block from the new event
+      if (offsetInData <= typedData.length - blockSize) {
+        // Yup, then let's do that
+        final end = offsetInData + blockSize;
+        controller.add(typedData.sublistView(offsetInData, end));
+        offsetInData = end;
+
+        // Once again, stop and save state if the controller was paused.
+        if (saveStateIfPaused()) return;
+      } else {
+        // Ok, no full block but we can start a new pending chunk
+        startChunk(typedData, offsetInData);
+        break;
+      }
+    }
+  }
+
+  void startResume() {
+    isResuming = false;
+    if (controller.isPausedOrClosed) return;
+
+    // Start dispatching pending events before we resume the subscription on the
+    // main stream.
+    if (pendingEvent != null) {
+      final pending = pendingEvent!;
+      assert(startedChunk == null, 'Had pending events and a started chunk');
+
+      while (offsetInPendingEvent < pending.length) {
+        // Can we serve a full block from pending data?
+        if (offsetInPendingEvent <= pending.length - blockSize) {
+          final end = offsetInPendingEvent + blockSize;
+          controller.add(pending.sublistView(offsetInPendingEvent, end));
+          offsetInPendingEvent = end;
+
+          // Pause if we got a pause request in response to the add
+          if (controller.isPausedOrClosed) return;
+        } else {
+          // Store pending block that we can't finish with the pending chunk.
+          startChunk(pending, offsetInPendingEvent);
+          break;
+        }
+      }
+
+      // Pending events have been dispatched
+      offsetInPendingEvent = 0;
+      pendingEvent = null;
+    }
+
+    // When we're here, all pending events have been dispatched and the
+    // controller is not paused. Let's continue then!
+    inputSubscription.resume();
+  }
+
+  void onDone() {
+    // Input stream is done. If we have a block left over, emit that now
+    if (startedChunk != null) {
+      controller
+          .add(startedChunk!.sublistView(0, blockSize - missingForNextChunk));
+    }
+    controller.close();
+  }
+
+  controller
+    ..onListen = () {
+      inputSubscription = input.listen(handleData,
+          onError: controller.addError, onDone: onDone);
+    }
+    ..onPause = () {
+      if (!inputSubscription.isPaused) {
+        inputSubscription.pause();
+      }
+    }
+    ..onResume = () {
+      // This is a bit hacky. Our subscription is most likely going to be a
+      // _BufferingStreamSubscription which will buffer events that were added
+      // in this callback. However, we really want to know when the subscription
+      // has been paused in response to a new event because we can handle that
+      // very efficiently.
+      if (!isResuming) {
+        scheduleMicrotask(startResume);
+      }
+      isResuming = true;
+    }
+    ..onCancel = () {
+      inputSubscription.cancel();
+    };
+
+  return controller.stream;
+}
+
+extension on StreamController<dynamic> {
+  bool get isPausedOrClosed => isPaused || isClosed;
+}
+
+extension ReadInChunks on Stream<List<int>> {
+  /// A stream emitting values in chunks of `512` byte blocks.
+  ///
+  /// The last emitted chunk may be shorter than the regular block length.
+  Stream<Uint8List> get inChunks => _inChunks(this);
+}
+
+extension NextOrNull<T extends Object> on StreamIterator<T> {
+  Future<T?> get nextOrNull async {
+    if (await moveNext()) {
+      return current;
+    } else {
+      return null;
+    }
+  }
+
+  Stream<T> nextElements(int count) {
+    if (count == 0) return const Stream<Never>.empty();
+
+    var remaining = count;
+    Future<Object?>? pendingOperation;
+    final controller = StreamController<T>(sync: true);
+
+    void addNewEvent() {
+      if (pendingOperation == null && remaining > 0) {
+        // Start fetching data
+        final fetchNext = nextOrNull.then<Object?>((value) {
+          remaining--;
+          if (value != null) {
+            // Got data, let's add it
+            controller.add(value);
+          }
+
+          if (value == null || remaining == 0) {
+            // Finished, so close the controller
+            return controller.close();
+          } else {
+            return Future.value();
+          }
+        }, onError: controller.addError);
+
+        pendingOperation = fetchNext.whenComplete(() {
+          pendingOperation = null;
+          if (!controller.isPaused && remaining > 0) {
+            // Controller isn't paused, so add another event
+            addNewEvent();
+          }
+        });
+      }
+    }
+
+    controller
+      ..onListen = addNewEvent
+      ..onResume = addNewEvent;
+
+    return controller.stream;
   }
 }

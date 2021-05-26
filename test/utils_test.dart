@@ -183,6 +183,10 @@ void main() {
       });
     }
   });
+
+  group('inChunks', () {
+    test('keeps data in tact', () {});
+  });
 }
 
 Uint8List _bytes(String str) {

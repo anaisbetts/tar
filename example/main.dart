@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -5,7 +6,8 @@ import 'package:tar/tar.dart';
 
 Future<void> main() async {
   // Start reading a tar file
-  final reader = TarReader(File('reference/gnu.tar').openRead());
+  final reader =
+      TarReader(File('reference/neats_test/gnu-incremental.tar').openRead());
 
   while (await reader.moveNext()) {
     final header = reader.current.header;
@@ -13,7 +15,10 @@ Future<void> main() async {
 
     // Print the output if it's a regular file
     if (header.typeFlag == TypeFlag.reg) {
-      await reader.current.contents.transform(utf8.decoder).forEach(print);
+      await reader.current.contents.forEach((chunk) {
+        print(chunk.length);
+        print(utf8.decode(chunk));
+      });
     }
   }
 
